@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
         - name: acitbuggy
-          image: 124355683348.dkr.ecr.us-east-2.amazonaws.com/asg:latest
+          image: 124355683348.dkr.ecr.us-east-2.amazonaws.com/asg:1.1.0
           imagePullPolicy: Always
           ports:
             - containerPort: 8080
@@ -36,3 +36,4 @@ spec:
       port: 80
       targetPort: 8080
       protocol: TCP
+
