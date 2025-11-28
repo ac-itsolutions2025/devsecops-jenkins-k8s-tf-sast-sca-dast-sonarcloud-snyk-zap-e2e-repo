@@ -1,180 +1,96 @@
+// Needed so the docker image handle `app` is visible across stages
+def app
+
 pipeline {
-    agent any
-    
-    tools { 
-        maven 'Maven_3.8.4'  
+  agent any
+
+  tools {
+    maven 'Maven_3.8.4'
+  }
+
+  stages {
+
+    stage('Compile and Run Sonar Analysis') {
+      steps {
+        // Use Jenkins credentials instead of hardcoding the token
+        withCredentials([string(credentialsId: 'sonarcloud-token', variable: 'SONAR_TOKEN')]) {
+          sh """
+            mvn clean verify sonar:sonar \
+              -Dsonar.projectKey=acitbuggywebapp \
+              -Dsonar.organization=acitbuggywebapp \
+              -Dsonar.host.url=https://sonarcloud.io \
+              -Dsonar.token=${SONAR_TOKEN}
+          """
+        }
+      }
     }
-    
-    environment {
-        SONAR_TOKEN = credentials('sonarcloud-token')
-        ECR_REGISTRY = '124355683348.dkr.ecr.us-east-2.amazonaws.com'
-        IMAGE_NAME = 'asg'
-        IMAGE_TAG = "1.2.0-${BUILD_NUMBER}"
+
+    stage('Build') {
+      steps {
+        withDockerRegistry([credentialsId: 'dockerlogin', url: '']) {
+          script {
+            // Build local Docker image named "asg"
+            app = docker.build("asg")
+          }
+        }
+      }
     }
-    
-    stages {
-        stage('CompileandRunSonarAnalysis') {
-            steps {	
-                sh '''
-                    mvn clean verify sonar:sonar \
-                    -Dsonar.projectKey=acitbuggywebapp \
-                    -Dsonar.organization=acitbuggywebapp \
-                    -Dsonar.host.url=https://sonarcloud.io \
-                    -Dsonar.token=${SONAR_TOKEN}
-                '''
-            }
+
+    stage('Push') {
+      steps {
+        script {
+          // Push to ECR with tag 1.2.0
+          docker.withRegistry('https://124355683348.dkr.ecr.us-east-2.amazonaws.com', 'ecr:us-east-2:aws-credentials') {
+            app.push("1.2.0")
+          }
         }
-        
-        stage('Build Docker Image') { 
-            steps { 
-                script {
-                    app = docker.build("${IMAGE_NAME}:${IMAGE_TAG}")
-                }
-            }
-        }
-        
-        stage('Push to ECR') {
-            steps {
-                script {
-                    docker.withRegistry("https://${ECR_REGISTRY}", 'ecr:us-east-2:aws-credentials') {
-                        app.push("${IMAGE_TAG}")
-                        app.push("latest")
-                    }
-                }
-            }
-        }
-        
-        stage('Update Deployment Manifest') {
-            steps {
-                script {
-                    sh """
-                        sed -i 's|image:.*|image: ${ECR_REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}|g' deployment.yaml
-                    """
-                }
-            }
-        }
-        
-        stage('Deploy to Kubernetes') {
-            steps {
-                withKubeConfig([credentialsId: 'kubelogin']) {
-                    sh '''
-                        kubectl create namespace devsecops --dry-run=client -o yaml | kubectl apply -f -
-                        kubectl apply -f deployment.yaml --namespace=devsecops
-                        kubectl rollout status deployment/acitbuggy-deployment -n devsecops --timeout=5m
-                    '''
-                }
-            }
-        }
-        
-        stage('Wait for LoadBalancer') {
-            steps {
-                script {
-                    withKubeConfig([credentialsId: 'kubelogin']) {
-                        timeout(time: 5, unit: 'MINUTES') {
-                            sh '''
-                                echo "Waiting for LoadBalancer to be ready..."
-                                while true; do
-                                    LB_HOSTNAME=$(kubectl get svc acitbuggy -n devsecops -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
-                                    LB_IP=$(kubectl get svc acitbuggy -n devsecops -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null)
-                                    
-                                    if [ ! -z "$LB_HOSTNAME" ] || [ ! -z "$LB_IP" ]; then
-                                        echo "LoadBalancer is ready!"
-                                        break
-                                    fi
-                                    
-                                    echo "Still waiting for LoadBalancer..."
-                                    sleep 10
-                                done
-                            '''
-                        }
-                    }
-                }
-            }
-        }
-        
-        stage('Verify Application') {
-            steps {
-                script {
-                    withKubeConfig([credentialsId: 'kubelogin']) {
-                        timeout(time: 5, unit: 'MINUTES') {
-                            sh '''
-                                LB_URL=$(kubectl get svc acitbuggy -n devsecops -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-                                if [ -z "$LB_URL" ]; then
-                                    LB_URL=$(kubectl get svc acitbuggy -n devsecops -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-                                fi
-                                
-                                echo "Application URL: http://$LB_URL"
-                                
-                                # Wait for application to respond
-                                for i in {1..30}; do
-                                    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://$LB_URL || echo "000")
-                                    if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "302" ] || [ "$HTTP_CODE" = "301" ]; then
-                                        echo "Application is responding! HTTP Code: $HTTP_CODE"
-                                        break
-                                    fi
-                                    echo "Waiting for application to be ready... Attempt $i/30 (HTTP: $HTTP_CODE)"
-                                    sleep 10
-                                done
-                            '''
-                        }
-                    }
-                }
-            }
-        }
-        
-        stage('Run DAST Using ZAP') {
-            steps {
-                script {
-                    withKubeConfig([credentialsId: 'kubelogin']) {
-                        try {
-                            sh '''
-                                LB_URL=$(kubectl get svc acitbuggy -n devsecops -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-                                if [ -z "$LB_URL" ]; then
-                                    LB_URL=$(kubectl get svc acitbuggy -n devsecops -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-                                fi
-                                
-                                echo "Running ZAP scan on: http://$LB_URL"
-                                
-                                # Run ZAP using Docker
-                                docker run --rm \
-                                    -v ${WORKSPACE}:/zap/wrk:rw \
-                                    -t ghcr.io/zaproxy/zaproxy:stable \
-                                    zap-baseline.py \
-                                    -t http://$LB_URL \
-                                    -r zap_report.html \
-                                    -I
-                                
-                                echo "ZAP scan completed"
-                            '''
-                        } catch (Exception e) {
-                            echo "ZAP scan failed: ${e.message}"
-                            currentBuild.result = 'UNSTABLE'
-                        } finally {
-                            archiveArtifacts artifacts: 'zap_report.html', allowEmptyArchive: true
-                            publishHTML([
-                                allowMissing: true,
-                                alwaysLinkToLastBuild: true,
-                                keepAll: true,
-                                reportDir: '.',
-                                reportFiles: 'zap_report.html',
-                                reportName: 'ZAP DAST Report'
-                            ])
-                        }
-                    }
-                }
-            }
-        }
+      }
     }
-    
-    post {
-        success {
-            echo 'Pipeline completed successfully!'
+
+    stage('Kubernetes Deployment of ACIT Buggy Web Application') {
+      steps {
+        withKubeConfig([credentialsId: 'kubelogin']) {
+          // Optional: this wipes ALL resources in the namespace – be sure you want this
+          sh 'kubectl delete all --all -n devsecops || true'
+          sh 'kubectl apply -f deployment.yaml --namespace=devsecops'
         }
-        failure {
-            echo 'Pipeline failed!'
-        }
-        always {
-            cleanWs()
-        }
+      }
     }
+
+    stage('Wait For Testing') {
+      steps {
+        sh 'pwd; sleep 180; echo "Application has been deployed on K8S"'
+      }
+    }
+
+    stage('RunDASTUsingZAP') {
+      steps {
+        withKubeConfig([credentialsId: 'kubelogin']) {
+          script {
+            sh '''
+              set -e
+
+              # Get LoadBalancer hostname for the acitbuggy service
+              LB_HOST=$(kubectl get service acitbuggy --namespace=devsecops -o json \
+                | jq -r '.status.loadBalancer.ingress[0].hostname')
+
+              echo "Running OWASP ZAP against: http://$LB_HOST"
+
+              # Run OWASP ZAP using Docker image (no need to install zap.sh on the agent)
+              docker run --rm \
+                -v "$PWD:/zap/wrk" \
+                owasp/zap2docker-stable \
+                zap.sh -cmd \
+                  -quickurl "http://$LB_HOST" \
+                  -quickprogress \
+                  -quickout "zap_report.html"
+            '''
+
+            // Archive the ZAP report
+            archiveArtifacts artifacts: 'zap_report.html'
+          }
+        }
+      }
+    }
+  }
 }
