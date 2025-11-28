@@ -135,10 +135,16 @@ pipeline {
                                 
                                 echo "Running ZAP scan on: http://$LB_URL"
                                 
-                                zap.sh -cmd \
-                                    -quickurl http://$LB_URL \
-                                    -quickprogress \
-                                    -quickout ${WORKSPACE}/zap_report.html
+                                # Run ZAP using Docker
+                                docker run --rm \
+                                    -v ${WORKSPACE}:/zap/wrk:rw \
+                                    -t ghcr.io/zaproxy/zaproxy:stable \
+                                    zap-baseline.py \
+                                    -t http://$LB_URL \
+                                    -r zap_report.html \
+                                    -I
+                                
+                                echo "ZAP scan completed"
                             '''
                         } catch (Exception e) {
                             echo "ZAP scan failed: ${e.message}"
